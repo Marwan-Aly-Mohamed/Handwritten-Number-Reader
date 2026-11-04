@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Handwritten Number Reader</title>
+
+  <style>
+    /* ---------- Look of the page ---------- */
+    body {
+      font-family: Arial, sans-serif;
+      background: #f2f4f8;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      margin: 0;
+      padding: 24px;
+    }
+    h1 { margin-bottom: 4px; }
+    p.hint { color: #555; margin-top: 0; }
+
+    /* The wrapper holds BOTH canvases stacked on top of each other.
+       position: relative lets the overlay canvas be placed exactly over the drawing canvas. */
+    .board-wrap {
+      position: relative;
+      width: 800px;
+      max-width: 100%;
+      border: 2px solid #333;
+      border-radius: 8px;
+      background: white;
+      box-sizing: border-box;
+      overflow: hidden;
+    }
+
+    /* The drawing canvas: scales down on small screens but keeps its shape */
+    #board {
+      display: block;
+      width: 100%;
+      height: auto;
+      touch-action: none;      /* stops the page from scrolling while you draw on a touch screen */
+      cursor: crosshair;
+    }
+
+    /* The overlay canvas: sits on top, shows the boxes, and ignores the mouse
+       (pointer-events: none), so you can keep drawing "through" it */
+    #overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    .controls {
+      margin: 14px 0 6px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .controls label { color: #333; }
+
+    button {
+      font-size: 18px;
+      padding: 10px 22px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    #predictBtn { background: #2563eb; color: white; }
+    #undoBtn, #clearBtn { background: #d1d5db; }
+
+    #result { font-size: 56px; font-weight: bold; min-height: 70px; }
+    #result .low { color: #dc2626; }      /* digits the model is unsure about turn red */
+    #details { color: #444; font-size: 16px; }
+    #warning { color: #b91c1c; font-size: 16px; margin-top: 8px; min-height: 22px; font-weight: bold; }
+  </style>
+</head>
+
+<body>
+  <h1>Handwritten Number Reader</h1>
+  <p class="hint">Write any number below. Leave a small gap between digits.</p>
+
+  <div class="board-wrap">
+    <canvas id="board" width="800" height="300"></canvas>     <!-- where you draw -->
+    <canvas id="overlay" width="800" height="300"></canvas>   <!-- where the boxes appear -->
+  </div>
+
+  <div class="controls">
+    <label for="brush">Brush size: <span id="brushValue">14</span></label>
+    <input type="range" id="brush" min="6" max="30" value="14">
+    <button id="undoBtn">Undo</button>
+    <button id="predictBtn">Predict</button>
+    <button id="clearBtn">Clear</button>
+  </div>
+
+  <div id="result"></div>    <!-- the big predicted number -->
+  <div id="details"></div>   <!-- confidence of each digit -->
+  <div id="warning"></div>   <!-- warning for low-confidence digits -->
+
+  <script>
+    // ---------- Settings you can change ----------
+    const LOW_CONFIDENCE = 80;    // digits below this percentage are marked as "not sure"
+    const MAX_HISTORY = 20;       // how many Undo steps we remember
+
+    // ---------- Get the page elements we need ----------
+    const board = document.getElementById("board");
+    const ctx = board.getContext("2d");              // the pen for the drawing canvas
+    const overlay = document.getElementById("overlay");
+    const octx = overlay.getContext("2d");           // the pen for the overlay (boxes)
+
+    const resultBox = document.getElementById("result");
+    const detailsBox = document.getElementById("details");
+    const warningBox = document.getElementById("warning");
+    const brushSlider = document.getElementById("brush");
+    const brushValue = document.getElementById("brushValue");
+
+    // History for Undo: a list of "photos" of the canvas, taken before each stroke
+    let history = [];
+
+    // ---------- Clearing helpers ----------
+    function clearOverlay() {
+      octx.clearRect(0, 0, overlay.width, overlay.height);   // erase all boxes
+    }
+
+    function clearResults() {
+      resultBox.textContent = "";
+      detailsBox.textContent = "";
+      warningBox.textContent = "";
+      clearOverlay();
+    }
+
+    function clearBoard() {
+      ctx.fillStyle = "white";
+      ctx.fillRect(0, 0, board.width, board.height);   // paint everything white
+      history = [];                                    // nothing left to undo
+      clearResults();
+    }
+    clearBoard();
+
+    // ---------- Pen settings ----------
+    // Thick black round line. Thick strokes matter because the picture is later
+    // shrunk to 28x28 pixels, and thin lines would disappear.
+    ctx.strokeStyle = "black";
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = Number(brushSlider.value);
+
+    // Brush size slider: change the pen thickness when the slider moves
+    brushSlider.addEventListener("input", () => {
+      ctx.lineWidth = Number(brushSlider.value);
+      brushValue.textContent = brushSlider.value;
+    });
+
+    // ---------- Undo ----------
+    function saveSnapshot() {
+      // Take a "photo" of the canvas and keep it in the history list
+      history.push(ctx.getImageData(0, 0, board.width, board.height));
+      if (history.length > MAX_HISTORY) history.shift();   // forget the oldest one
+    }
+
+    document.getElementById("undoBtn").addEventListener("click", () => {
+      if (history.length === 0) return;                    // nothing to undo
+      ctx.putImageData(history.pop(), 0, 0);               // restore the last photo
+      clearResults();                                      // old boxes no longer match the drawing
+    });
+
+    // ---------- Drawing with mouse or finger ----------
+    let drawing = false;   // true while the mouse button / finger is down
+
+    // The canvas may be displayed smaller than its real size (on a phone),
+    // so we convert the pointer position to real canvas pixels.
+    function getPosition(event) {
+      const rect = board.getBoundingClientRect();
+      return {
+        x: (event.clientX - rect.left) * (board.width / rect.width),
+        y: (event.clientY - rect.top) * (board.height / rect.height)
+      };
+    }
+
+    board.addEventListener("pointerdown", (event) => {
+      saveSnapshot();           // remember the canvas BEFORE this stroke (for Undo)
+      clearResults();           // a new stroke makes the old result and boxes out of date
+      drawing = true;
+      const p = getPosition(event);
+      ctx.beginPath();          // start a new line
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x, p.y);     // draw a dot, so a single click leaves a mark
+      ctx.stroke();
+    });
+
+    board.addEventListener("pointermove", (event) => {
+      if (!drawing) return;     // only draw while the button is held down
+      const p = getPosition(event);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    });
+
+    window.addEventListener("pointerup", () => { drawing = false; });
+    board.addEventListener("pointerleave", () => { drawing = false; });
+
+    document.getElementById("clearBtn").addEventListener("click", clearBoard);
+
+    // ---------- Draw a box around each digit the server found ----------
+    function drawBoxes(digits) {
+      octx.lineWidth = 4;
+      octx.font = "bold 26px Arial";
+
+      digits.forEach((d) => {
+        const [x, y, w, h] = d.box;                        // box = [left, top, width, height]
+        const low = d.confidence < LOW_CONFIDENCE;         // is the model unsure about this digit?
+        const color = low ? "#dc2626" : "#16a34a";         // red if unsure, green if sure
+
+        octx.strokeStyle = color;
+        octx.fillStyle = color;
+        octx.strokeRect(x - 6, y - 6, w + 12, h + 12);     // the box, with a small margin around the digit
+
+        // Label: the predicted digit and its confidence, above the box
+        // (if there is no room above, put it below the box instead)
+        const label = d.digit + "  " + Math.round(d.confidence) + "%";
+        const labelY = (y - 14 < 26) ? (y + h + 34) : (y - 14);
+        octx.fillText(label, x, labelY);
+      });
+    }
+
+    // ---------- Predict ----------
+    document.getElementById("predictBtn").addEventListener("click", async () => {
+      clearResults();
+      resultBox.textContent = "Reading...";
+
+      // Turn the drawing into text (base64 PNG) so it can be sent to the server.
+      // Only the drawing canvas is sent, so the boxes never reach the model.
+      const imageData = board.toDataURL("image/png");
+
+      try {
+        const response = await fetch("/predict", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: imageData })
+        });
+
+        if (!response.ok) throw new Error("Server error " + response.status);
+
+        const data = await response.json();   // {"number": "482", "digits": [...]}
+
+        if (data.number === "") {
+          resultBox.textContent = "";
+          detailsBox.textContent = "Nothing found. Draw a number first.";
+          return;
+        }
+
+        // Big number: one <span> per digit, so unsure digits can be colored red
+        resultBox.textContent = "";
+        data.digits.forEach((d) => {
+          const span = document.createElement("span");
+          span.textContent = d.digit;
+          if (d.confidence < LOW_CONFIDENCE) span.className = "low";
+          resultBox.appendChild(span);
+        });
+
+        // Small text under the number: each digit with its confidence
+        detailsBox.textContent = data.digits
+          .map((d) => d.digit + " (" + d.confidence + "%)")
+          .join("   ");
+
+        // Warning: list the digits the model is not sure about
+        const unsure = data.digits
+          .map((d, i) => ({ position: i + 1, digit: d.digit, confidence: d.confidence }))
+          .filter((d) => d.confidence < LOW_CONFIDENCE);
+
+        if (unsure.length > 0) {
+          warningBox.textContent = "Please check: " + unsure
+            .map((d) => "digit #" + d.position + " (read as " + d.digit + ", " + d.confidence + "%)")
+            .join(", ");
+        }
+
+        drawBoxes(data.digits);   // draw the boxes on the overlay
+
+      } catch (error) {
+        resultBox.textContent = "";
+        detailsBox.textContent = "Something went wrong: " + error.message;
+      }
+    });
+  </script>
+</body>
+</html>

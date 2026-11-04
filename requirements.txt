@@ -1,0 +1,10 @@
+# Libraries the server must install (PyTorch is no longer needed)
+fastapi
+uvicorn
+python-multipart
+numpy
+pillow
+onnxruntime
+
+# "headless" = OpenCV without the desktop-window parts, which servers don't have
+opencv-python-headless
